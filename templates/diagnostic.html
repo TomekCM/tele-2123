@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Диагностика отправки сообщений</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        h1 { color: #333; }
+        .form-container { border: 1px solid #ddd; padding: 20px; margin-bottom: 20px; background-color: #f9f9f9; }
+        .button { background-color: #4CAF50; color: white; padding: 10px 15px; border: none; cursor: pointer; }
+        .button:hover { background-color: #45a049; }
+        .message { border-left: 4px solid #ddd; padding: 10px; margin: 10px 0; }
+        .sent { border-left-color: #4CAF50; background-color: #f0fff0; }
+        .pending { border-left-color: #ff9800; background-color: #fff8e1; }
+        .status { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 12px; }
+        .status-sent { background-color: #4CAF50; color: white; }
+        .status-pending { background-color: #ff9800; color: white; }
+    </style>
+</head>
+<body>
+    <h1>Диагностика отправки сообщений</h1>
+    
+    <div class="form-container">
+        <h2>Отправка прямого сообщения</h2>
+        <form id="directForm" action="/api/direct-message" method="post">
+            <div>
+                <label for="userId">ID пользователя:</label>
+                <input type="text" id="userId" name="user_id" value="{{ user_id }}" required>
+            </div>
+            <div style="margin-top: 10px;">
+                <label for="messageText">Текст сообщения:</label>
+                <textarea id="messageText" name="message_text" rows="4" style="width: 100%;" required>Тестовое сообщение из диагностической формы {{ timestamp }}</textarea>
+            </div>
+            <div style="margin-top: 10px;">
+                <button type="submit" class="button">Отправить сообщение</button>
+            </div>
+        </form>
+    </div>
+    
+    <h2>Последние сообщения</h2>
+    
+    {% for message in messages %}
+    <div class="message {% if message.telegram_sent == 1 %}sent{% else %}pending{% endif %}">
+        <div style="display: flex; justify-content: space-between;">
+            <div><strong>ID:</strong> {{ message.id }}</div>
+            <div>
+                <span class="status {% if message.telegram_sent == 1 %}status-sent{% else %}status-pending{% endif %}">
+                    {% if message.telegram_sent == 1 %}Отправлено{% else %}Ожидает отправки{% endif %}
+                </span>
+            </div>
+        </div>
+        <div><strong>Пользователь:</strong> {{ message.user_id }}</div>
+        <div><strong>Отправлено:</strong> {{ message.timestamp }}</div>
+        <div style="margin-top: 10px;"><strong>Текст:</strong> {{ message.reply_text }}</div>
+    </div>
+    {% endfor %}
+    
+    <div style="margin-top: 20px; text-align: center;">
+        <a href="/diagnostic?refresh=true" class="button">Обновить страницу</a>
+        <a href="/" class="button" style="margin-left: 10px; background-color: #2196F3;">Вернуться на главную</a>
+    </div>
+    
+    <script>
+        // Простой JavaScript для отслеживания отправки формы
+        document.getElementById('directForm').addEventListener('submit', function(e) {
+            console.log('Форма отправлена');
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Debug Information</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        .actions { margin-top: 20px; }
+        .actions a { margin-right: 15px; }
+    </style>
+</head>
+<body>
+    <h1>Database Debug Information</h1>
+    <p>Total messages in database: <strong>{{ total_count }}</strong></p>
+    
+    <h2>Users with Messages</h2>
+    <table>
+        <tr>
+            <th>User ID</th>
+            <th>Message Count</th>
+            <th>Unread Messages</th>
+            <th>Last Message Time</th>
+            <th>Actions</th>
+        </tr>
+        {% for user in users %}
+        <tr>
+            <td>{{ user.user_id }}</td>
+            <td>{{ user.message_count }}</td>
+            <td>{{ user.unread_count }}</td>
+            <td>{{ user.last_message }}</td>
+            <td>
+                <a href="/api/messages/{{ user.user_id }}">View Messages</a>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+    
+    <div class="actions">
+        <a href="/">Back to Main Interface</a>
+    </div>
+</body>
+</html>

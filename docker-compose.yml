@@ -1,0 +1,28 @@
+version: '3'
+
+services:
+  bot:
+    build: .
+    command: python bot.py
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    restart: always
+    
+  webserver:
+    build: .
+    command: python server.py
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    ports:
+      - "5000:5000"
+    restart: always
+    
+  integration:
+    build: .
+    command: python bot_server_integration.py
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    restart: always
