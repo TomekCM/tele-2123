@@ -1,20 +1,21 @@
-import asyncio
+import os
 import json
 import logging
-import os
-import random
-import re
+import asyncio
 import time
-import traceback
-from datetime import datetime
-
-import aiohttp
+import random
 import requests
-from bs4 import BeautifulSoup
+import re
+from datetime import datetime
 from dotenv import load_dotenv
-from fake_useragent import UserAgent
 from telegram import Update, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.error import TelegramError
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+from urllib.parse import quote
+import aiohttp
+import traceback
 
 # Конфигурация логирования
 logging.basicConfig(
@@ -368,21 +369,11 @@ class TwitterClient:
         if not tweets or len(tweets) == 0:
             return user_id, None, None
 
-        # Ищем непинненные твиты
-        for tweet in tweets:
-            tweet_id = tweet["id"]
-            tweet_text = tweet["text"]
-            tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
-
-            # Пропускаем оффициальные репосты и пинненные (примитивная проверка)
-            is_pinned = "RT @" in tweet_text[:4] or "Pinned tweet" in tweet_text
-            if not is_pinned:
-                return user_id, tweet_id, {"text": tweet_text, "url": tweet_url}
-
-        # Если все твиты оказались пинненными или репостами, вернем первый
-        tweet_id = tweets[0]["id"]
-        tweet_text = tweets[0]["text"]
+        latest = tweets[0]
+        tweet_id = latest["id"]
+        tweet_text = latest["text"]
         tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
+
         return user_id, tweet_id, {"text": tweet_text, "url": tweet_url}
 
 
@@ -435,9 +426,9 @@ class TwitterScrapers:
             await self.async_session.close()
             self.async_session = None
 
-    # Обновленный метод веб-скрапинга
+    # Оригинальный метод веб-скрапинга
     def get_latest_tweet_web(self, username, use_proxies=False):
-        """Получает последний твит пользователя через веб-страницу Twitter, игнорируя закрепленные"""
+        """Получает последний твит пользователя через веб-страницу Twitter"""
         cache_key = self.get_cache_key("web", username)
         cached = self.get_cached_data(cache_key)
         if cached:
@@ -475,11 +466,10 @@ class TwitterScrapers:
             # Ищем ссылки на твиты с помощью BeautifulSoup
             soup = BeautifulSoup(response.text, "html.parser")
 
-            # 1. Находим все твиты на странице
-            tweet_containers = soup.select('article[data-testid="tweet"]')
-
-            if not tweet_containers:
-                # Если не нашли через селекторы, используем регулярное выражение
+            # Пробуем найти твиты по разным паттернам (Twitter часто меняет структуру)
+            tweet_links = soup.select('a[href*="/status/"]')
+            if not tweet_links:
+                # Используем регулярное выражение как запасной вариант
                 tweet_ids = re.findall(r'/status/(\d+)', response.text)
                 if not tweet_ids:
                     logger.info(f"Твиты не найдены на странице {username}")
@@ -487,66 +477,36 @@ class TwitterScrapers:
 
                 # Берем первый найденный ID твита
                 tweet_id = tweet_ids[0]
-                tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
-                return tweet_id, {"text": "[Новый твит]", "url": tweet_url}
-
-            # 2. Проверяем каждый твит, начиная с первого (пропускаем закрепленные)
-            for tweet in tweet_containers:
-                # Проверяем, является ли твит закрепленным
-                pinned_badge = tweet.select('div[data-testid="socialContext"] span')
-                is_pinned = False
-
-                if pinned_badge:
-                    for badge in pinned_badge:
-                        # Проверяем текст на содержание маркеров закрепленного твита
-                        badge_text = badge.get_text(strip=True).lower()
-                        if "pinned" in badge_text or "закрепл" in badge_text or "закріпл" in badge_text:
-                            is_pinned = True
-                            break
-
-                # Пропускаем закрепленный твит
-                if is_pinned:
-                    continue
-
-                # Получаем ссылку на твит
-                tweet_link = tweet.select_one('a[href*="/status/"]')
-                if not tweet_link or "href" not in tweet_link.attrs:
-                    continue
-
-                href = tweet_link['href']
+            else:
+                # Извлекаем ID из первой найденной ссылки
+                href = tweet_links[0]['href']
                 match = re.search(r'/status/(\d+)', href)
                 if not match:
-                    continue
-
+                    return None, None
                 tweet_id = match.group(1)
-                tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
 
-                # Получаем текст твита
-                text_elements = tweet.select('div[data-testid="tweetText"]')
-                tweet_text = "[Новый твит]"
+            # Создаем URL твита
+            tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
 
+            # Пробуем найти текст твита
+            tweet_text = "[Новый твит]"
+            tweet_containers = soup.select('article[data-testid="tweet"]')
+            if tweet_containers:
+                text_elements = tweet_containers[0].select('div[data-testid="tweetText"]')
                 if text_elements:
                     tweet_text = text_elements[0].get_text(strip=True)
                     if len(tweet_text) > 280:  # Ограничиваем длину
                         tweet_text = tweet_text[:277] + "..."
 
-                # Проверяем наличие треда (многочастного твита)
-                thread_indicator = tweet.select('div[role="link"][data-testid*="reply"]')
-                if thread_indicator:
-                    tweet_text += "\n[Многочастный твит - показана первая часть]"
-
-                result = (tweet_id, {"text": tweet_text, "url": tweet_url})
-                self.set_cache(cache_key, result)
-                return result
-
-            # Если не нашли обычных твитов (все закрепленные или страница пуста)
-            return None, None
+            result = (tweet_id, {"text": tweet_text, "url": tweet_url})
+            self.set_cache(cache_key, result)
+            return result
 
         except Exception as e:
             logger.error(f"Ошибка при получении твита через веб для {username}: {e}")
             return None, None
 
-    # Обновленный метод для Nitter
+    # Метод получения твитов через Nitter
     def get_latest_tweet_nitter(self, username, use_proxies=False):
         """Получает последний твит пользователя через Nitter (альтернативный фронтенд)"""
         cache_key = self.get_cache_key("nitter", username)
@@ -595,53 +555,40 @@ class TwitterScrapers:
                 soup = BeautifulSoup(response.text, "html.parser")
 
                 # Nitter имеет более стабильную структуру HTML
-                # Получаем все твиты
-                timeline_items = soup.select(".timeline-item")
-                if not timeline_items:
+                timeline = soup.select(".timeline-item")
+                if not timeline:
                     logger.info(f"Твиты не найдены на Nitter для {username}")
                     continue  # Пробуем следующий инстанс
 
-                # Перебираем твиты, игнорируя закрепленные
-                for item in timeline_items:
-                    # Проверяем, является ли твит закрепленным
-                    pinned_icon = item.select_one(".pinned")
-                    if pinned_icon:
-                        continue  # Пропускаем закрепленный твит
+                # Берем первый твит
+                tweet = timeline[0]
 
-                    # Получаем ID и ссылку
-                    link = item.select_one(".tweet-link")
-                    if not link or "href" not in link.attrs:
-                        continue
+                # Извлекаем ID твита
+                link = tweet.select_one(".tweet-link")
+                if not link or "href" not in link.attrs:
+                    continue  # Пробуем следующий инстанс
 
-                    href = link["href"]
-                    match = re.search(r'/status/(\d+)', href)
-                    if not match:
-                        continue
+                href = link["href"]
+                match = re.search(r'/status/(\d+)', href)
+                if not match:
+                    continue  # Пробуем следующий инстанс
 
-                    tweet_id = match.group(1)
+                tweet_id = match.group(1)
 
-                    # Извлекаем текст твита
-                    content = item.select_one(".tweet-content")
-                    tweet_text = content.get_text(strip=True) if content else "[Новый твит]"
+                # Извлекаем текст твита
+                content = tweet.select_one(".tweet-content")
+                tweet_text = content.get_text(strip=True) if content else "[Новый твит]"
 
-                    # Проверяем наличие треда (многочастного твита)
-                    thread_indicator = item.select_one(".thread-line") or item.select_one(".more-replies")
-                    if thread_indicator:
-                        tweet_text += "\n[Многочастный твит - показана первая часть]"
+                # Ограничиваем длину текста
+                if len(tweet_text) > 280:
+                    tweet_text = tweet_text[:277] + "..."
 
-                    # Ограничиваем длину текста
-                    if len(tweet_text) > 280:
-                        tweet_text = tweet_text[:277] + "..."
+                # Создаем URL для оригинального твита на Twitter
+                tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
 
-                    # Создаем URL для оригинального твита на Twitter
-                    tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
-
-                    result = (tweet_id, {"text": tweet_text, "url": tweet_url})
-                    self.set_cache(cache_key, result)
-                    return result
-
-                # Если все твиты закрепленные, то переходим к следующему инстансу
-                continue
+                result = (tweet_id, {"text": tweet_text, "url": tweet_url})
+                self.set_cache(cache_key, result)
+                return result
 
             except Exception as e:
                 logger.error(f"Ошибка при получении твита через Nitter для {username}: {e}")
@@ -687,7 +634,7 @@ class TwitterScrapers:
             tweetdeck_api_url = f"https://api.tweetdeck.com/1.1/statuses/user_timeline.json"
             params = {
                 "screen_name": username,
-                "count": 5,  # Запрашиваем больше твитов чтобы игнорировать закрепленные
+                "count": 1,
                 "include_entities": "false",
                 "include_ext_alt_text": "false",
                 "include_reply_count": "false",
@@ -705,18 +652,6 @@ class TwitterScrapers:
             if not tweets or len(tweets) == 0:
                 return None, None
 
-            # Ищем непинненные твиты
-            for tweet in tweets:
-                if not tweet.get("pinned", False):  # Пропускаем закрепленные
-                    tweet_id = tweet.get("id_str")
-                    tweet_text = tweet.get("text", "[Новый твит]")
-                    tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
-
-                    result = (tweet_id, {"text": tweet_text, "url": tweet_url})
-                    self.set_cache(cache_key, result)
-                    return result
-
-            # Если все твиты закрепленные, берем первый
             latest = tweets[0]
             tweet_id = latest.get("id_str")
             tweet_text = latest.get("text", "[Новый твит]")
@@ -1242,7 +1177,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет новые твиты для всех аккаунтов"""
     if hasattr(update, 'callback_query') and update.callback_query:
         message = await update.callback_query.edit_message_text("Проверяем твиты...")
     else:
@@ -1258,112 +1192,6 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = get_settings()
     use_proxies = settings.get("use_proxies", False)
     methods = settings.get("scraper_methods", ["nitter", "web", "api"])
-
-    results = []
-    new_tweets = []
-    found_tweets = []  # Список для хранения всех найденных твитов
-    accounts_updated = False
-
-    # Проверяем каждый аккаунт
-    for username, account in accounts.items():
-        display_name = account.get('username', username)
-        last_id = account.get('last_tweet_id')
-
-        # Обновляем время проверки
-        account['last_check'] = datetime.now().isoformat()
-        account['check_count'] = account.get('check_count', 0) + 1
-        accounts_updated = True
-
-        try:
-            # Используем мультиметодную проверку
-            user_id, tweet_id, tweet_data, method = await check_tweet_multi_method(
-                display_name, methods, use_proxies
-            )
-
-            # Обновляем ID пользователя, если получили новый
-            if user_id and not account.get('user_id'):
-                account['user_id'] = user_id
-                accounts_updated = True
-
-            # Если не нашли твит
-            if not tweet_id:
-                # Увеличиваем счетчик неудач
-                account['fail_count'] = account.get('fail_count', 0) + 1
-
-                # Обновляем процент успеха
-                total_checks = account.get('check_count', 1)
-                fail_count = account.get('fail_count', 0)
-                account['success_rate'] = 100 * (total_checks - fail_count) / total_checks
-
-                # Если есть сохраненный твит, показываем его
-                if last_id:
-                    results.append(f"❓ @{display_name}: твиты не найдены, последний известный ID: {last_id}")
-                else:
-                    results.append(f"❓ @{display_name}: твиты не найдены")
-                continue
-
-            # Сбрасываем счетчик неудач при успехе
-            if account.get('fail_count', 0) > 0:
-                account['fail_count'] = max(0, account.get('fail_count', 0) - 1)
-
-            # Обновляем процент успеха
-            total_checks = account.get('check_count', 1)
-            fail_count = account.get('fail_count', 0)
-            account['success_rate'] = 100 * (total_checks - fail_count) / total_checks
-
-            # Обновляем метод проверки
-            account['check_method'] = method
-
-            # Сохраняем информацию о найденном твите
-            if tweet_data:
-                found_tweets.append({
-                    'username': display_name,
-                    'tweet_id': tweet_id,
-                    'content': tweet_data.get('text', ''),
-                    'date': tweet_data.get('date', ''),
-                    'method': method
-                })
-
-                # Проверяем, новый ли это твит
-                if not last_id or int(tweet_id) > int(last_id):
-                    # Новый твит!
-                    account['last_tweet_id'] = tweet_id
-                    accounts_updated = True
-
-                    # Формируем сообщение о новом твите
-                    tweet_text = tweet_data.get('text', 'Текст недоступен')
-                    tweet_url = f"https://twitter.com/{display_name}/status/{tweet_id}"
-
-                    new_tweet_msg = f"🔥 Новый твит от @{display_name}:\n\n{tweet_text}\n\n🔗 {tweet_url}"
-                    new_tweets.append(new_tweet_msg)
-                    results.append(f"✅ @{display_name}: новый твит {tweet_id} (метод: {method})")
-                else:
-                    # Твит не новый
-                    results.append(f"✅ @{display_name}: нет новых твитов (метод: {method})")
-
-        except Exception as e:
-            # Обработка ошибок
-            logger.error(f"Ошибка при проверке @{display_name}: {e}")
-            results.append(f"⚠️ @{display_name}: ошибка при проверке: {str(e)[:50]}...")
-            account['fail_count'] = account.get('fail_count', 0) + 1
-
-    # Сохраняем обновленные аккаунты, если были изменения
-    if accounts_updated:
-        save_accounts(accounts)
-
-    # Формируем итоговое сообщение
-    if new_tweets:
-        for tweet_msg in new_tweets:
-            await message.reply_text(tweet_msg, disable_web_page_preview=False)
-
-    # Отправляем сводку
-    result_text = "📊 Результаты проверки:\n\n" + "\n".join(results)
-
-    # Если текст слишком длинный, разбиваем на части
-    if len(result_text) > 4000:
-        result_text = result_text[:3997] + "..."
-
-    await message.edit_text(result_text)
 
     results = []
     new_tweets = []
@@ -1468,18 +1296,22 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверяем состояние API и Nitter
     twitter_api = TwitterClient(TWITTER_BEARER)
     api_limited = twitter_api.rate_limited
+    settings = get_settings()
+    nitter_instances = settings.get("nitter_instances", [])
 
-    # Формируем статус сообщение
-    status_msg = []
+    # Формируем сообщение о статусе
+    status_msg = ""
     if api_limited and "api" in methods:
         reset_time = datetime.fromtimestamp(twitter_api.rate_limit_reset).strftime("%H:%M:%S")
-        status_msg.append(f"⚠️ Twitter API в лимите до {reset_time}")
+        status_msg += f"⚠️ Twitter API в лимите до {reset_time}. Используются альтернативные методы.\n\n"
+
+    if not nitter_instances and "nitter" in methods:
+        status_msg += "⚠️ Все Nitter-инстансы недоступны, используется прямой скрапинг Twitter.\n\n"
 
     # Показываем результаты
     if new_tweets:
         # Сначала отправляем сводку
-        await message.edit_text(f"✅ Найдено {len(new_tweets)} новых твитов!" +
-                                (f"\n\n{'. '.join(status_msg)}" if status_msg else ""))
+        await message.edit_text(f"{status_msg}✅ Найдено {len(new_tweets)} новых твитов!")
 
         # Затем отправляем каждый твит отдельным сообщением
         for tweet in new_tweets:
@@ -1491,11 +1323,12 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Выбираем первый твит для показа
             first_tweet = found_tweets[0]
             tweet_msg = (
-                    f"🔍 Новых твитов не найдено." +
-                    (f"\n{'. '.join(status_msg)}" if status_msg else "") +
-                    f"\n\n📱 Последний твит @{first_tweet['username']}:\n" +
-                    f"{first_tweet['data']['text']}\n\n" +
-                    f"🔗 {first_tweet['data']['url']}"
+                    f"{status_msg}🔍 Новых твитов не найдено.\n\n"
+                    f"📊 Результаты проверки:\n"
+                    + "\n".join(results)
+                    + f"\n\n📱 Последний твит @{first_tweet['username']}:\n"
+                      f"{first_tweet['data']['text']}\n\n"
+                      f"🔗 {first_tweet['data']['url']}"
             )
 
             # Создаем клавиатуру с кнопками
@@ -1504,27 +1337,13 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📋 Список аккаунтов", callback_data="list")
             ]])
 
-            try:
-                await message.edit_text(tweet_msg, reply_markup=keyboard, disable_web_page_preview=False)
-            except Exception as e:
-                # Если сообщение слишком длинное, отправляем сокращенную версию
-                logger.error(f"Ошибка при отправке полного сообщения: {e}")
-                short_msg = (
-                        f"🔍 Новых твитов не найдено." +
-                        (f"\n{'. '.join(status_msg)}" if status_msg else "") +
-                        f"\n\n📱 Последний твит @{first_tweet['username']}:\n" +
-                        f"{first_tweet['data']['text'][:150]}..." +  # Сокращаем текст
-                        f"\n\n🔗 {first_tweet['data']['url']}"
-                )
-                await message.edit_text(short_msg, reply_markup=keyboard)
+            await message.edit_text(tweet_msg, reply_markup=keyboard, disable_web_page_preview=False)
         else:
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔄 Проверить снова", callback_data="check"),
                 InlineKeyboardButton("📋 Список аккаунтов", callback_data="list")
             ]])
-            await message.edit_text((f"🔍 Твиты не найдены." +
-                                     (f"\n{'. '.join(status_msg)}" if status_msg else "") +
-                                     f"\n\n" + "\n".join(results)), reply_markup=keyboard)
+            await message.edit_text(f"{status_msg}🔍 Твиты не найдены.\n\n" + "\n".join(results), reply_markup=keyboard)
 
 
 async def cmd_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
