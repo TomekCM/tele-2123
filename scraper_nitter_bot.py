@@ -1,8 +1,7 @@
 import os
 import json
-import logging
-import asyncio
 import time
+import logging
 import random
 import requests
 import re
@@ -60,13 +59,18 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def save_accounts(accounts_data):
+    """Сохраняет данные аккаунтов в JSON файл"""
+    save_json(ACCOUNTS_FILE, accounts_data)
+
+
 # Управление настройками
 def get_settings():
     return load_json(SETTINGS_FILE, {
         "check_interval": DEFAULT_CHECK_INTERVAL,
         "enabled": True,
         "use_proxies": False,
-        "scraper_methods": ["nitter", "web", "api"],  # Приоритет методов
+        "scraper_methods": ["web", "nitter", "api"],  # Web метод на первом месте!
         "max_retries": 3,
         "cache_expiry": 3600,  # Срок действия кеша в секундах
         "randomize_intervals": True,
@@ -154,6 +158,9 @@ def init_accounts():
                 updated = True
             if "priority" not in account:
                 account["priority"] = 1.0
+                updated = True
+            if "first_check" not in account:
+                account["first_check"] = True
                 updated = True
 
         if updated:
@@ -428,7 +435,7 @@ class TwitterScrapers:
 
     # Оригинальный метод веб-скрапинга
     def get_latest_tweet_web(self, username, use_proxies=False):
-        """Получает последний твит пользователя через веб-страницу Twitter"""
+        """Улучшенный метод получения последнего твита через прямой скрапинг Twitter"""
         cache_key = self.get_cache_key("web", username)
         cached = self.get_cached_data(cache_key)
         if cached:
@@ -450,57 +457,123 @@ class TwitterScrapers:
             proxies = get_random_proxy() if use_proxies else None
 
             # Проверяем существование аккаунта
-            response = self.session.get(url, headers=headers, proxies=proxies, timeout=10)
+            response = self.session.get(url, headers=headers, proxies=proxies, timeout=15)
 
             if response.status_code == 429:
                 logger.warning(f"Ограничение запросов при скрапинге {username}, пробуем с другим юзер-агентом")
                 # Пробуем еще раз с другим юзер-агентом
                 headers["User-Agent"] = self.get_random_user_agent()
                 time.sleep(2)  # Небольшая пауза
-                response = self.session.get(url, headers=headers, proxies=proxies, timeout=10)
+                response = self.session.get(url, headers=headers, proxies=proxies, timeout=15)
 
             if response.status_code != 200:
                 logger.warning(f"Не удалось получить страницу Twitter для {username}, код {response.status_code}")
                 return None, None
 
-            # Ищем ссылки на твиты с помощью BeautifulSoup
+            # Ищем твиты в разных форматах (Twitter часто меняет структуру)
             soup = BeautifulSoup(response.text, "html.parser")
 
-            # Пробуем найти твиты по разным паттернам (Twitter часто меняет структуру)
-            tweet_links = soup.select('a[href*="/status/"]')
-            if not tweet_links:
-                # Используем регулярное выражение как запасной вариант
-                tweet_ids = re.findall(r'/status/(\d+)', response.text)
-                if not tweet_ids:
-                    logger.info(f"Твиты не найдены на странице {username}")
-                    return None, None
-
-                # Берем первый найденный ID твита
-                tweet_id = tweet_ids[0]
-            else:
-                # Извлекаем ID из первой найденной ссылки
-                href = tweet_links[0]['href']
-                match = re.search(r'/status/(\d+)', href)
-                if not match:
-                    return None, None
-                tweet_id = match.group(1)
-
-            # Создаем URL твита
-            tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
-
-            # Пробуем найти текст твита
-            tweet_text = "[Новый твит]"
+            # Поиск по селекторам Twitter
             tweet_containers = soup.select('article[data-testid="tweet"]')
+
             if tweet_containers:
-                text_elements = tweet_containers[0].select('div[data-testid="tweetText"]')
-                if text_elements:
-                    tweet_text = text_elements[0].get_text(strip=True)
-                    if len(tweet_text) > 280:  # Ограничиваем длину
+                # Сначала ищем непинненные твиты
+                for container in tweet_containers:
+                    # Проверяем, является ли твит закрепленным
+                    pinned = False
+                    pinned_elements = container.select('[data-testid="socialContext"]')
+                    for elem in pinned_elements:
+                        if "закрепл" in elem.text.lower() or "pinned" in elem.text.lower():
+                            pinned = True
+                            break
+
+                    if pinned:
+                        continue  # Пропускаем закрепленные твиты
+
+                    # Проверяем, является ли твит репостом
+                    is_repost = False
+                    for elem in pinned_elements:
+                        if "ретвит" in elem.text.lower() or "retweet" in elem.text.lower():
+                            is_repost = True
+                            break
+
+                    if is_repost:
+                        continue  # Пропускаем репосты
+
+                    # Ищем текст твита
+                    tweet_text_elements = container.select('[data-testid="tweetText"]')
+                    tweet_text = "[Новый твит]"
+                    if tweet_text_elements:
+                        tweet_text = tweet_text_elements[0].get_text(strip=True)
+                        if len(tweet_text) > 280:
+                            tweet_text = tweet_text[:277] + "..."
+
+                    # Ищем ID твита
+                    tweet_link = None
+                    links = container.select('a')
+                    for link in links:
+                        href = link.get('href', '')
+                        if '/status/' in href:
+                            tweet_link = href
+                            break
+
+                    if not tweet_link:
+                        continue
+
+                    # Извлекаем ID твита
+                    match = re.search(r'/status/(\d+)', tweet_link)
+                    if not match:
+                        continue
+
+                    tweet_id = match.group(1)
+                    tweet_url = f"https://twitter.com{tweet_link}"
+
+                    # Нашли твит!
+                    result = (tweet_id, {"text": tweet_text, "url": tweet_url})
+                    self.set_cache(cache_key, result)
+                    return result
+
+                # Если не нашли непинненных твитов, берем первый любой твит
+                first_container = tweet_containers[0]
+                tweet_text_elements = first_container.select('[data-testid="tweetText"]')
+                tweet_text = "[Твит]"
+                if tweet_text_elements:
+                    tweet_text = tweet_text_elements[0].get_text(strip=True)
+                    if len(tweet_text) > 280:
                         tweet_text = tweet_text[:277] + "..."
 
-            result = (tweet_id, {"text": tweet_text, "url": tweet_url})
-            self.set_cache(cache_key, result)
-            return result
+                # Ищем ID твита
+                tweet_link = None
+                links = first_container.select('a')
+                for link in links:
+                    href = link.get('href', '')
+                    if '/status/' in href:
+                        tweet_link = href
+                        break
+
+                if tweet_link:
+                    match = re.search(r'/status/(\d+)', tweet_link)
+                    if match:
+                        tweet_id = match.group(1)
+                        tweet_url = f"https://twitter.com{tweet_link}"
+
+                        # Возвращаем найденный твит
+                        result = (tweet_id, {"text": tweet_text, "url": tweet_url})
+                        self.set_cache(cache_key, result)
+                        return result
+
+            # Если не нашли твиты через BS4, используем регулярное выражение
+            tweet_ids = re.findall(r'/status/(\d+)', response.text)
+            if tweet_ids:
+                tweet_id = tweet_ids[0]
+                tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
+                tweet_text = "[Новый твит]"
+
+                result = (tweet_id, {"text": tweet_text, "url": tweet_url})
+                self.set_cache(cache_key, result)
+                return result
+
+            return None, None  # Если все методы не сработали
 
         except Exception as e:
             logger.error(f"Ошибка при получении твита через веб для {username}: {e}")
@@ -554,41 +627,65 @@ class TwitterScrapers:
                 # Парсим HTML
                 soup = BeautifulSoup(response.text, "html.parser")
 
-                # Nitter имеет более стабильную структуру HTML
-                timeline = soup.select(".timeline-item")
-                if not timeline:
+                # Находим все твиты
+                timeline_items = soup.select(".timeline-item")
+                if not timeline_items:
                     logger.info(f"Твиты не найдены на Nitter для {username}")
                     continue  # Пробуем следующий инстанс
 
-                # Берем первый твит
-                tweet = timeline[0]
+                # Сначала ищем непинненные твиты
+                for item in timeline_items:
+                    # Проверяем, является ли твит закрепленным
+                    pinned_icon = item.select_one(".pinned")
+                    if pinned_icon:
+                        continue  # Пропускаем закрепленный твит
 
-                # Извлекаем ID твита
-                link = tweet.select_one(".tweet-link")
-                if not link or "href" not in link.attrs:
-                    continue  # Пробуем следующий инстанс
+                    # Получаем ID твита
+                    link = item.select_one(".tweet-link")
+                    if not link or "href" not in link.attrs:
+                        continue
 
-                href = link["href"]
-                match = re.search(r'/status/(\d+)', href)
-                if not match:
-                    continue  # Пробуем следующий инстанс
+                    href = link["href"]
+                    match = re.search(r'/status/(\d+)', href)
+                    if not match:
+                        continue
 
-                tweet_id = match.group(1)
+                    tweet_id = match.group(1)
 
-                # Извлекаем текст твита
-                content = tweet.select_one(".tweet-content")
-                tweet_text = content.get_text(strip=True) if content else "[Новый твит]"
+                    # Проверяем, что это основной твит пользователя, а не ретвит или ответ
+                    tweet_header = item.select_one(".tweet-header")
+                    if tweet_header:
+                        header_text = tweet_header.get_text(strip=True).lower()
+                        if "retweeted" in header_text or "ретвитнул" in header_text:
+                            continue  # Пропускаем ретвиты
 
-                # Ограничиваем длину текста
-                if len(tweet_text) > 280:
-                    tweet_text = tweet_text[:277] + "..."
+                    # Извлекаем текст твита
+                    content = item.select_one(".tweet-content")
+                    tweet_text = content.get_text(strip=True) if content else "[Новый твит]"
 
-                # Создаем URL для оригинального твита на Twitter
-                tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
+                    # Создаем URL для оригинального твита на Twitter
+                    tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
 
-                result = (tweet_id, {"text": tweet_text, "url": tweet_url})
-                self.set_cache(cache_key, result)
-                return result
+                    result = (tweet_id, {"text": tweet_text, "url": tweet_url})
+                    self.set_cache(cache_key, result)
+                    return result
+
+                # Если не нашли непинненных твитов, берем первый (даже если он закрепленный)
+                if timeline_items:
+                    item = timeline_items[0]
+                    link = item.select_one(".tweet-link")
+                    if link and "href" in link.attrs:
+                        href = link["href"]
+                        match = re.search(r'/status/(\d+)', href)
+                        if match:
+                            tweet_id = match.group(1)
+                            content = item.select_one(".tweet-content")
+                            tweet_text = content.get_text(strip=True) if content else "[Твит]"
+                            tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
+
+                            result = (tweet_id, {"text": tweet_text, "url": tweet_url})
+                            self.set_cache(cache_key, result)
+                            return result
 
             except Exception as e:
                 logger.error(f"Ошибка при получении твита через Nitter для {username}: {e}")
@@ -725,7 +822,7 @@ class TwitterScrapers:
 async def check_tweet_multi_method(username, methods=None, use_proxies=False):
     """Проверяет твиты всеми доступными методами, возвращает первый успешный результат"""
     if not methods:
-        methods = ["nitter", "web", "api"]
+        methods = ["web", "nitter", "api"]  # По умолчанию web первым
 
     twitter_api = TwitterClient(TWITTER_BEARER)
     scrapers = TwitterScrapers()
@@ -869,7 +966,7 @@ async def toggle_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def change_method_priority(update: Update, context: ContextTypes.DEFAULT_TYPE, method):
     """Изменяет приоритет методов проверки"""
     settings = get_settings()
-    methods = settings.get("scraper_methods", ["nitter", "web", "api"])
+    methods = settings.get("scraper_methods", ["web", "nitter", "api"])
 
     # Перемещаем выбранный метод в начало списка
     if method in methods:
@@ -892,7 +989,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     interval_mins = settings.get("check_interval", DEFAULT_CHECK_INTERVAL) // 60
     enabled = settings.get("enabled", True)
     use_proxies = settings.get("use_proxies", False)
-    methods = settings.get("scraper_methods", ["nitter", "web", "api"])
+    methods = settings.get("scraper_methods", ["web", "nitter", "api"])
     parallel_checks = settings.get("parallel_checks", 3)
     randomize = settings.get("randomize_intervals", True)
 
@@ -1054,6 +1151,7 @@ async def cmd_update_nitter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавляет новый аккаунт для отслеживания без отправки первого твита"""
     if not context.args:
         return await update.message.reply_text("Использование: /add <username>")
 
@@ -1065,10 +1163,10 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = await update.message.reply_text(f"Проверяем @{username}...")
 
-    # Получаем настройки
+    # Получаем настройки и устанавливаем web как приоритетный метод
     settings = get_settings()
     use_proxies = settings.get("use_proxies", False)
-    methods = settings.get("scraper_methods", ["nitter", "web", "api"])
+    methods = settings.get("scraper_methods", ["web", "nitter", "api"])
 
     # Используем мультиметодную проверку
     user_id, tweet_id, tweet_data, method = await check_tweet_multi_method(
@@ -1088,10 +1186,10 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tweet_id:
         return await message.edit_text(f"❌ Не удалось найти аккаунт @{username} или получить его твиты.")
 
-    # Добавляем аккаунт
+    # Добавляем аккаунт с флагом first_check для отслеживания первой проверки
     accounts[username.lower()] = {
         "username": username,
-        "user_id": user_id,  # Может быть None
+        "user_id": user_id,
         "added_at": datetime.now().isoformat(),
         "last_check": datetime.now().isoformat(),
         "last_tweet_id": tweet_id,
@@ -1099,18 +1197,15 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "success_rate": 100.0,
         "fail_count": 0,
         "check_method": method,
-        "priority": 1.0
+        "priority": 1.0,
+        "first_check": True  # Флаг первой проверки
     }
-    save_json(ACCOUNTS_FILE, accounts)
+    save_accounts(accounts)
 
-    # Сообщаем о результате
-    result = f"✅ Добавлен @{username}\nПоследний твит: {tweet_id}\nМетод проверки: {method}"
+    # Сообщаем о результате БЕЗ отправки самого твита
+    result = f"✅ Добавлен @{username}\n\nНайден твит с ID: {tweet_id}\nМетод проверки: {method}\n\nБот будет отслеживать новые твиты с этого момента."
     await message.edit_text(result)
-
-    # Отправляем твит, если есть данные
-    if tweet_data:
-        tweet_msg = f"🐦 @{username}:\n\n{tweet_data['text']}\n\n{tweet_data['url']}"
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=tweet_msg)
+    # НЕ отправляем твит при добавлении аккаунта
 
 
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1124,11 +1219,12 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text(f"@{username} не найден в списке.")
 
     del accounts[username.lower()]
-    save_json(ACCOUNTS_FILE, accounts)
+    save_accounts(accounts)
     await update.message.reply_text(f"✅ Удалён @{username}.")
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отображает список отслеживаемых аккаунтов"""
     accounts = init_accounts()
 
     if not accounts:
@@ -1177,6 +1273,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет новые твиты для всех аккаунтов"""
     if hasattr(update, 'callback_query') and update.callback_query:
         message = await update.callback_query.edit_message_text("Проверяем твиты...")
     else:
@@ -1191,7 +1288,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     settings = get_settings()
     use_proxies = settings.get("use_proxies", False)
-    methods = settings.get("scraper_methods", ["nitter", "web", "api"])
+    methods = settings.get("scraper_methods", ["web", "nitter", "api"])
 
     results = []
     new_tweets = []
@@ -1202,6 +1299,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for username, account in accounts.items():
         display_name = account.get('username', username)
         last_id = account.get('last_tweet_id')
+        first_check = account.get('first_check', False)  # Проверяем флаг первой проверки
 
         # Обновляем время проверки
         account['last_check'] = datetime.now().isoformat()
@@ -1248,88 +1346,77 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Обновляем метод проверки
             account['check_method'] = method
 
-            # Сохраняем информацию о найденном твите в любом случае
+            # Сохраняем информацию о найденном твите
             if tweet_data:
                 found_tweets.append({
                     'username': display_name,
                     'tweet_id': tweet_id,
-                    'data': tweet_data,
-                    'is_new': tweet_id != last_id
-                })
-
-            # Если это первая проверка или новый твит
-            if not last_id:
-                account['last_tweet_id'] = tweet_id
-                accounts_updated = True
-                results.append(f"📝 @{display_name}: сохранен ID твита {tweet_id}")
-            elif tweet_id != last_id:
-                # Нашли новый твит!
-                account['last_tweet_id'] = tweet_id
-                accounts_updated = True
-                new_tweets.append({
-                    'username': display_name,
-                    'tweet_id': tweet_id,
                     'data': tweet_data
                 })
-                results.append(f"✅ @{display_name}: найден новый твит {tweet_id} (метод: {method})")
+
+            # Если это первая проверка, снимаем флаг и не считаем твит новым
+            if first_check:
+                account['first_check'] = False
+                account['last_tweet_id'] = tweet_id
+                accounts_updated = True
+                results.append(f"📝 @{display_name}: первая проверка, сохранен ID твита {tweet_id}")
+            # Если ID твита изменился - это может быть новый твит
+            elif tweet_id != last_id:
+                # Проверяем, что это действительно более новый твит по ID
+                try:
+                    # Сравниваем как числа
+                    is_newer = int(tweet_id) > int(last_id)
+                except (ValueError, TypeError):
+                    # Если не удалось сравнить как числа, считаем что новый
+                    is_newer = True
+
+                if is_newer:
+                    # Обнаружен новый твит!
+                    account['last_tweet_id'] = tweet_id
+                    accounts_updated = True
+
+                    # Формируем сообщение о новом твите
+                    tweet_text = tweet_data.get('text', 'Текст недоступен')
+                    tweet_url = tweet_data.get('url', f"https://twitter.com/{display_name}/status/{tweet_id}")
+
+                    new_tweet_msg = f"🔥 Новый твит от @{display_name}:\n\n{tweet_text}\n\n🔗 {tweet_url}"
+                    new_tweets.append(new_tweet_msg)
+                    results.append(f"✅ @{display_name}: новый твит {tweet_id} (метод: {method})")
+                else:
+                    # ID изменился, но твит старее - просто обновляем ID
+                    account['last_tweet_id'] = tweet_id
+                    accounts_updated = True
+                    results.append(f"🔄 @{display_name}: обновлен ID твита на {tweet_id} (метод: {method})")
             else:
+                # ID не изменился - твит не новый
                 results.append(f"🔄 @{display_name}: нет новых твитов (метод: {method})")
 
         except Exception as e:
             logger.error(f"Ошибка при проверке @{display_name}: {e}")
             traceback.print_exc()
-
-            # Увеличиваем счетчик неудач
+            results.append(f"❌ @{display_name}: ошибка - {str(e)[:50]}")
             account['fail_count'] = account.get('fail_count', 0) + 1
 
-            # Обновляем процент успеха
-            total_checks = account.get('check_count', 1)
-            fail_count = account.get('fail_count', 0)
-            account['success_rate'] = 100 * (total_checks - fail_count) / total_checks
+        # Сохраняем обновленные аккаунты
+        if accounts_updated:
+            save_accounts(accounts)
 
-            results.append(f"❌ @{display_name}: ошибка - {str(e)[:50]}")
+        # Отправляем новые твиты
+        if new_tweets:
+            # Сначала отправляем сводку
+            await message.edit_text(f"✅ Найдено {len(new_tweets)} новых твитов!")
 
-    # Сохраняем обновленные данные
-    if accounts_updated:
-        save_json(ACCOUNTS_FILE, accounts)
+            # Затем отправляем каждый твит отдельным сообщением
+            for tweet_msg in new_tweets:
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=tweet_msg,
+                                               disable_web_page_preview=False)
+        else:
+            # Формируем итоговое сообщение
+            result_text = "🔍 Новых твитов не найдено.\n\n📊 Результаты проверки:\n" + "\n".join(results)
 
-    # Проверяем состояние API и Nitter
-    twitter_api = TwitterClient(TWITTER_BEARER)
-    api_limited = twitter_api.rate_limited
-    settings = get_settings()
-    nitter_instances = settings.get("nitter_instances", [])
-
-    # Формируем сообщение о статусе
-    status_msg = ""
-    if api_limited and "api" in methods:
-        reset_time = datetime.fromtimestamp(twitter_api.rate_limit_reset).strftime("%H:%M:%S")
-        status_msg += f"⚠️ Twitter API в лимите до {reset_time}. Используются альтернативные методы.\n\n"
-
-    if not nitter_instances and "nitter" in methods:
-        status_msg += "⚠️ Все Nitter-инстансы недоступны, используется прямой скрапинг Twitter.\n\n"
-
-    # Показываем результаты
-    if new_tweets:
-        # Сначала отправляем сводку
-        await message.edit_text(f"{status_msg}✅ Найдено {len(new_tweets)} новых твитов!")
-
-        # Затем отправляем каждый твит отдельным сообщением
-        for tweet in new_tweets:
-            tweet_msg = f"🐦 @{tweet['username']}:\n\n{tweet['data']['text']}\n\n{tweet['data']['url']}"
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=tweet_msg)
-    else:
-        # Даже если нет новых твитов, показываем последние известные
-        if found_tweets:
-            # Выбираем первый твит для показа
-            first_tweet = found_tweets[0]
-            tweet_msg = (
-                    f"{status_msg}🔍 Новых твитов не найдено.\n\n"
-                    f"📊 Результаты проверки:\n"
-                    + "\n".join(results)
-                    + f"\n\n📱 Последний твит @{first_tweet['username']}:\n"
-                      f"{first_tweet['data']['text']}\n\n"
-                      f"🔗 {first_tweet['data']['url']}"
-            )
+            # Если результаты слишком длинные
+            if len(result_text) > 4000:
+                result_text = result_text[:3997] + "..."
 
             # Создаем клавиатуру с кнопками
             keyboard = InlineKeyboardMarkup([[
@@ -1337,227 +1424,296 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📋 Список аккаунтов", callback_data="list")
             ]])
 
-            await message.edit_text(tweet_msg, reply_markup=keyboard, disable_web_page_preview=False)
-        else:
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Проверить снова", callback_data="check"),
-                InlineKeyboardButton("📋 Список аккаунтов", callback_data="list")
-            ]])
-            await message.edit_text(f"{status_msg}🔍 Твиты не найдены.\n\n" + "\n".join(results), reply_markup=keyboard)
+            # Отправляем итоговое сообщение
+            await message.edit_text(result_text, reply_markup=keyboard)
 
-
-async def cmd_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        settings = get_settings()
-        current_mins = settings["check_interval"] // 60
-        return await update.message.reply_text(
-            f"Текущий интервал проверки: {current_mins} мин.\n"
-            f"Для изменения: /interval <минуты>"
-        )
-
-    try:
-        mins = int(context.args[0])
-        if mins < 1:
-            return await update.message.reply_text("Интервал должен быть не менее 1 минуты.")
-        if mins > 1440:  # 24 часа
-            return await update.message.reply_text("Интервал должен быть не более 1440 минут (24 часа).")
-
-        settings = update_setting("check_interval", mins * 60)
-        await update.message.reply_text(f"✅ Интервал проверки установлен на {mins} мин.")
-    except ValueError:
-        await update.message.reply_text("Использование: /interval <минуты>")
-
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает статистику работы бота"""
-    accounts = init_accounts()
-
-    if not accounts:
-        return await update.message.reply_text("Аккаунты не добавлены")
-
-    # Собираем статистику
-    total_checks = sum(acct.get("check_count", 0) for acct in accounts.values())
-    total_fails = sum(acct.get("fail_count", 0) for acct in accounts.values())
-    success_rate = 100.0 * (total_checks - total_fails) / max(1, total_checks)
-
-    # Методы проверки
-    methods = {}
-    for account in accounts.values():
-        method = account.get("check_method")
-        if method:
-            methods[method] = methods.get(method, 0) + 1
-
-    # Аккаунты с наибольшим процентом успешных проверок
-    most_reliable = sorted(
-        [(username, data.get("success_rate", 0)) for username, data in accounts.items()],
-        key=lambda x: x[1],
-        reverse=True
-    )[:5]
-
-    # Аккаунты с наименьшим процентом успешных проверок
-    least_reliable = sorted(
-        [(username, data.get("success_rate", 0)) for username, data in accounts.items()],
-        key=lambda x: x[1]
-    )[:5]
-
-    # Формируем сообщение
-    msg = (
-        "📊 **Статистика мониторинга**\n\n"
-        f"• Всего аккаунтов: {len(accounts)}\n"
-        f"• Всего проверок: {total_checks}\n"
-        f"• Успешных проверок: {total_checks - total_fails} ({success_rate:.1f}%)\n\n"
-
-        "**Методы проверки:**\n"
-    )
-
-    # Добавляем методы проверки
-    for method, count in methods.items():
-        percent = 100.0 * count / len(accounts)
-        msg += f"• {method}: {count} ({percent:.1f}%)\n"
-
-    # Добавляем надежные аккаунты
-    msg += "\n**Самые надежные аккаунты:**\n"
-    for username, rate in most_reliable:
-        msg += f"• @{accounts[username].get('username', username)}: {rate:.1f}%\n"
-
-    # Добавляем проблемные аккаунты
-    msg += "\n**Проблемные аккаунты:**\n"
-    for username, rate in least_reliable:
-        msg += f"• @{accounts[username].get('username', username)}: {rate:.1f}%\n"
-
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-# Глобальная переменная для фоновой задачи
-background_task = None
-
-
-async def background_check(app):
-    """Фоновая проверка аккаунтов"""
-    global background_task
-    background_task = asyncio.current_task()
-
-    await asyncio.sleep(10)  # Начальная задержка
-
-    while True:
-        try:
-            # Проверка на отмену задачи
-            if asyncio.current_task().cancelled():
-                logger.info("Фоновая задача отменена")
-                break
-
+    async def cmd_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
             settings = get_settings()
-            if not settings.get("enabled", True):
-                logger.info("Мониторинг отключен, пропускаем проверку")
-                await asyncio.sleep(settings["check_interval"])
-                continue
-
-            logger.info("Фоновая проверка аккаунтов")
-            subs = load_json(SUBSCRIBERS_FILE, [])
-            accounts = init_accounts()
-
-            # Пропускаем проверку, если нет подписчиков или аккаунтов
-            if not subs or not accounts:
-                logger.info("Нет подписчиков или аккаунтов, пропускаем проверку")
-                await asyncio.sleep(settings["check_interval"])
-                continue
-
-            # Получаем настройки
-            use_proxies = settings.get("use_proxies", False)
-            methods = settings.get("scraper_methods", ["nitter", "web", "api"])
-            parallel_checks = settings.get("parallel_checks", 3)
-            randomize = settings.get("randomize_intervals", True)
-            accounts_updated = False
-
-            # Сортируем аккаунты по времени последней проверки и приоритету
-            sorted_accounts = sorted(
-                accounts.items(),
-                key=lambda x: (
-                    datetime.fromisoformat(x[1].get("last_check", "2000-01-01T00:00:00")),
-                    -x[1].get("priority", 1.0)
-                )
+            current_mins = settings["check_interval"] // 60
+            return await update.message.reply_text(
+                f"Текущий интервал проверки: {current_mins} мин.\n"
+                f"Для изменения: /interval <минуты>"
             )
 
-            # Проверяем аккаунты группами для параллельной обработки
-            for i in range(0, len(sorted_accounts), parallel_checks):
-                # Если задача отменена, выходим
-                if asyncio.current_task().cancelled():
-                    logger.info("Фоновая задача отменена")
-                    return
+        try:
+            mins = int(context.args[0])
+            if mins < 1:
+                return await update.message.reply_text("Интервал должен быть не менее 1 минуты.")
+            if mins > 1440:  # 24 часа
+                return await update.message.reply_text("Интервал должен быть не более 1440 минут (24 часа).")
 
-                # Берем очередную группу аккаунтов
-                batch = sorted_accounts[i:i + parallel_checks]
-                tasks = []
+            settings = update_setting("check_interval", mins * 60)
+            await update.message.reply_text(f"✅ Интервал проверки установлен на {mins} мин.")
+        except ValueError:
+            await update.message.reply_text("Использование: /interval <минуты>")
 
-                # Создаем задачи для параллельной проверки аккаунтов
-                for username, account in batch:
-                    if asyncio.current_task().cancelled():
-                        break
+    async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает статистику работы бота"""
+        accounts = init_accounts()
 
-                    display_name = account.get('username', username)
-                    tasks.append(process_account(app, subs, accounts, display_name, account, methods, use_proxies))
+        if not accounts:
+            return await update.message.reply_text("Аккаунты не добавлены")
 
-                # Запускаем все задачи параллельно
-                if tasks:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for result in results:
-                        if isinstance(result, Exception):
-                            logger.error(f"Ошибка в параллельной проверке: {result}")
-                        elif result:  # Если был обновлен аккаунт
-                            accounts_updated = True
+        # Собираем статистику
+        total_checks = sum(acct.get("check_count", 0) for acct in accounts.values())
+        total_fails = sum(acct.get("fail_count", 0) for acct in accounts.values())
+        success_rate = 100.0 * (total_checks - total_fails) / max(1, total_checks)
 
-                # Небольшая задержка между группами
-                await asyncio.sleep(3)
+        # Методы проверки
+        methods = {}
+        for account in accounts.values():
+            method = account.get("check_method")
+            if method:
+                methods[method] = methods.get(method, 0) + 1
 
-            # Сохраняем обновленные данные
-            if accounts_updated:
-                save_json(ACCOUNTS_FILE, accounts)
+        # Аккаунты с наибольшим процентом успешных проверок
+        most_reliable = sorted(
+            [(username, data.get("success_rate", 0)) for username, data in accounts.items()],
+            key=lambda x: x[1],
+            reverse=True
+        )[:5]
 
-            # Определяем время до следующей проверки
-            if randomize:
-                # Случайное время в пределах диапазона
-                min_factor = settings.get("min_interval_factor", 0.8)
-                max_factor = settings.get("max_interval_factor", 1.2)
-                factor = random.uniform(min_factor, max_factor)
-                wait_time = int(settings["check_interval"] * factor)
-                logger.info(f"Случайное время ожидания: {wait_time} секунд (x{factor:.2f})")
-            else:
-                wait_time = settings["check_interval"]
-                logger.info(f"Следующая проверка через {wait_time} секунд")
+        # Аккаунты с наименьшим процентом успешных проверок
+        least_reliable = sorted(
+            [(username, data.get("success_rate", 0)) for username, data in accounts.items()],
+            key=lambda x: x[1]
+        )[:5]
 
-            await asyncio.sleep(wait_time)
+        # Формируем сообщение
+        msg = (
+            "📊 **Статистика мониторинга**\n\n"
+            f"• Всего аккаунтов: {len(accounts)}\n"
+            f"• Всего проверок: {total_checks}\n"
+            f"• Успешных проверок: {total_checks - total_fails} ({success_rate:.1f}%)\n\n"
 
-        except asyncio.CancelledError:
-            logger.info("Фоновая задача отменена")
-            break
-        except Exception as e:
-            logger.error(f"Ошибка в фоновой проверке: {e}")
-            traceback.print_exc()
-            # Не останавливаем задачу при ошибках
-            await asyncio.sleep(60)
-
-
-async def process_account(app, subs, accounts, username, account, methods, use_proxies):
-    """Обрабатывает один аккаунт и отправляет уведомления при новых твитах"""
-    try:
-        # Обновляем время проверки
-        account['last_check'] = datetime.now().isoformat()
-        account['check_count'] = account.get('check_count', 0) + 1
-
-        # Получаем последний известный твит
-        last_id = account.get('last_tweet_id')
-
-        # Используем мультиметодную проверку
-        user_id, tweet_id, tweet_data, method = await check_tweet_multi_method(
-            username, methods, use_proxies
+            "**Методы проверки:**\n"
         )
 
-        # Обновляем ID пользователя, если получили новый
-        if user_id and not account.get('user_id'):
-            account['user_id'] = user_id
+        # Добавляем методы проверки
+        for method, count in methods.items():
+            percent = 100.0 * count / len(accounts)
+            msg += f"• {method}: {count} ({percent:.1f}%)\n"
 
-        # Если не нашли твит
-        if not tweet_id:
+        # Добавляем надежные аккаунты
+        msg += "\n**Самые надежные аккаунты:**\n"
+        for username, rate in most_reliable:
+            msg += f"• @{accounts[username].get('username', username)}: {rate:.1f}%\n"
+
+        # Добавляем проблемные аккаунты
+        msg += "\n**Проблемные аккаунты:**\n"
+        for username, rate in least_reliable:
+            msg += f"• @{accounts[username].get('username', username)}: {rate:.1f}%\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    # Глобальная переменная для фоновой задачи
+    background_task = None
+
+    async def background_check(app):
+        """Фоновая проверка аккаунтов"""
+        global background_task
+        background_task = asyncio.current_task()
+
+        await asyncio.sleep(10)  # Начальная задержка
+
+        while True:
+            try:
+                # Проверка на отмену задачи
+                if asyncio.current_task().cancelled():
+                    logger.info("Фоновая задача отменена")
+                    break
+
+                settings = get_settings()
+                if not settings.get("enabled", True):
+                    logger.info("Мониторинг отключен, пропускаем проверку")
+                    await asyncio.sleep(settings["check_interval"])
+                    continue
+
+                logger.info("Фоновая проверка аккаунтов")
+                subs = load_json(SUBSCRIBERS_FILE, [])
+                accounts = init_accounts()
+
+                # Пропускаем проверку, если нет подписчиков или аккаунтов
+                if not subs or not accounts:
+                    logger.info("Нет подписчиков или аккаунтов, пропускаем проверку")
+                    await asyncio.sleep(settings["check_interval"])
+                    continue
+
+                # Получаем настройки
+                use_proxies = settings.get("use_proxies", False)
+                methods = settings.get("scraper_methods", ["web", "nitter", "api"])
+                parallel_checks = settings.get("parallel_checks", 3)
+                randomize = settings.get("randomize_intervals", True)
+                accounts_updated = False
+
+                # Сортируем аккаунты по времени последней проверки и приоритету
+                sorted_accounts = sorted(
+                    accounts.items(),
+                    key=lambda x: (
+                        datetime.fromisoformat(x[1].get("last_check", "2000-01-01T00:00:00")),
+                        -x[1].get("priority", 1.0)
+                    )
+                )
+
+                # Проверяем аккаунты группами для параллельной обработки
+                for i in range(0, len(sorted_accounts), parallel_checks):
+                    # Если задача отменена, выходим
+                    if asyncio.current_task().cancelled():
+                        logger.info("Фоновая задача отменена")
+                        return
+
+                    # Берем очередную группу аккаунтов
+                    batch = sorted_accounts[i:i + parallel_checks]
+                    tasks = []
+
+                    # Создаем задачи для параллельной проверки аккаунтов
+                    for username, account in batch:
+                        if asyncio.current_task().cancelled():
+                            break
+
+                        display_name = account.get('username', username)
+                        tasks.append(process_account(app, subs, accounts, display_name, account, methods, use_proxies))
+
+                    # Запускаем все задачи параллельно
+                    if tasks:
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                        for result in results:
+                            if isinstance(result, Exception):
+                                logger.error(f"Ошибка в параллельной проверке: {result}")
+                            elif result:  # Если был обновлен аккаунт
+                                accounts_updated = True
+
+                    # Небольшая задержка между группами
+                    await asyncio.sleep(3)
+
+                # Сохраняем обновленные данные
+                if accounts_updated:
+                    save_accounts(accounts)
+
+                # Определяем время до следующей проверки
+                if randomize:
+                    # Случайное время в пределах диапазона
+                    min_factor = settings.get("min_interval_factor", 0.8)
+                    max_factor = settings.get("max_interval_factor", 1.2)
+                    factor = random.uniform(min_factor, max_factor)
+                    wait_time = int(settings["check_interval"] * factor)
+                    logger.info(f"Случайное время ожидания: {wait_time} секунд (x{factor:.2f})")
+                else:
+                    wait_time = settings["check_interval"]
+                    logger.info(f"Следующая проверка через {wait_time} секунд")
+
+                await asyncio.sleep(wait_time)
+
+            except asyncio.CancelledError:
+                logger.info("Фоновая задача отменена")
+                break
+            except Exception as e:
+                logger.error(f"Ошибка в фоновой проверке: {e}")
+                traceback.print_exc()
+                # Не останавливаем задачу при ошибках
+                await asyncio.sleep(60)
+
+    async def process_account(app, subs, accounts, username, account, methods, use_proxies):
+        """Обрабатывает один аккаунт и отправляет уведомления при новых твитах"""
+        try:
+            # Обновляем время проверки
+            account['last_check'] = datetime.now().isoformat()
+            account['check_count'] = account.get('check_count', 0) + 1
+
+            # Получаем последний известный твит и проверяем флаг первой проверки
+            last_id = account.get('last_tweet_id')
+            first_check = account.get('first_check', False)
+
+            # Используем мультиметодную проверку
+            user_id, tweet_id, tweet_data, method = await check_tweet_multi_method(
+                username, methods, use_proxies
+            )
+
+            # Обновляем ID пользователя, если получили новый
+            if user_id and not account.get('user_id'):
+                account['user_id'] = user_id
+
+            # Если не нашли твит
+            if not tweet_id:
+                # Увеличиваем счетчик неудач
+                account['fail_count'] = account.get('fail_count', 0) + 1
+
+                # Обновляем процент успеха
+                total_checks = account.get('check_count', 1)
+                fail_count = account.get('fail_count', 0)
+                account['success_rate'] = 100 * (total_checks - fail_count) / total_checks
+
+                # Уменьшаем приоритет проблемных аккаунтов
+                if account.get('fail_count', 0) > 3:
+                    account['priority'] = max(0.1, account.get('priority', 1.0) * 0.9)
+
+                logger.info(f"Аккаунт @{username}: твиты не найдены (методы: {methods})")
+                return True
+
+            # Сбрасываем счетчик неудач при успехе и восстанавливаем приоритет
+            if account.get('fail_count', 0) > 0:
+                account['fail_count'] = max(0, account.get('fail_count', 0) - 1)
+
+            if account.get('priority', 1.0) < 1.0:
+                account['priority'] = min(1.0, account.get('priority', 1.0) * 1.1)
+
+            # Обновляем процент успеха
+            total_checks = account.get('check_count', 1)
+            fail_count = account.get('fail_count', 0)
+            account['success_rate'] = 100 * (total_checks - fail_count) / total_checks
+
+            # Обновляем метод проверки
+            account['check_method'] = method
+
+            # Если это первая проверка, снимаем флаг и не считаем твит новым
+            if first_check:
+                account['first_check'] = False
+                account['last_tweet_id'] = tweet_id
+                logger.info(f"Аккаунт @{username}: первая проверка, сохранен ID {tweet_id}")
+                return True
+
+            # Если нашли новый твит (ID изменился)
+            elif tweet_id != last_id:
+                try:
+                    # Проверяем, что это действительно более новый твит по ID
+                    is_newer = int(tweet_id) > int(last_id)
+                except (ValueError, TypeError):
+                    # Если не удалось сравнить как числа, считаем что новый
+                    is_newer = True
+
+                if is_newer:
+                    # Обнаружен новый твит!
+                    account['last_tweet_id'] = tweet_id
+                    logger.info(f"Аккаунт @{username}: новый твит {tweet_id}, отправляем уведомления")
+
+                    # Отправляем уведомления всем подписчикам
+                    if tweet_data:
+                        tweet_text = tweet_data.get('text', '[Новый твит]')
+                        tweet_url = tweet_data.get('url', f"https://twitter.com/{username}/status/{tweet_id}")
+                        tweet_msg = f"🐦 @{username}:\n\n{tweet_text}\n\n{tweet_url}"
+
+                        for chat_id in subs:
+                            try:
+                                await app.bot.send_message(chat_id=chat_id, text=tweet_msg,
+                                                           disable_web_page_preview=False)
+                                await asyncio.sleep(0.5)  # Небольшая задержка
+                            except Exception as e:
+                                logger.error(f"Ошибка отправки сообщения в чат {chat_id}: {e}")
+                    return True
+                else:
+                    # ID изменился, но твит старее - просто обновляем ID
+                    account['last_tweet_id'] = tweet_id
+                    logger.info(f"Аккаунт @{username}: обновлен ID твита на {tweet_id}")
+                    return True
+            else:
+                logger.info(f"Аккаунт @{username}: нет новых твитов (метод: {method})")
+                return False
+
+        except Exception as e:
+            logger.error(f"Ошибка при обработке аккаунта @{username}: {e}")
+            traceback.print_exc()
+
             # Увеличиваем счетчик неудач
             account['fail_count'] = account.get('fail_count', 0) + 1
 
@@ -1570,172 +1726,114 @@ async def process_account(app, subs, accounts, username, account, methods, use_p
             if account.get('fail_count', 0) > 3:
                 account['priority'] = max(0.1, account.get('priority', 1.0) * 0.9)
 
-            logger.info(f"Аккаунт @{username}: твиты не найдены (методы: {methods})")
             return True
 
-        # Сбрасываем счетчик неудач при успехе и восстанавливаем приоритет
-        if account.get('fail_count', 0) > 0:
-            account['fail_count'] = max(0, account.get('fail_count', 0) - 1)
+    async def on_startup(app):
+        """Вызывается при запуске бота"""
+        global background_task
 
-        if account.get('priority', 1.0) < 1.0:
-            account['priority'] = min(1.0, account.get('priority', 1.0) * 1.1)
+        # Инициализируем команды
+        await app.bot.set_my_commands([
+            BotCommand("start", "Начало работы"),
+            BotCommand("add", "Добавить аккаунт"),
+            BotCommand("remove", "Удалить аккаунт"),
+            BotCommand("list", "Список аккаунтов"),
+            BotCommand("check", "Проверить твиты"),
+            BotCommand("interval", "Интервал проверки"),
+            BotCommand("settings", "Настройки бота"),
+            BotCommand("proxy", "Управление прокси"),
+            BotCommand("stats", "Статистика мониторинга"),
+            BotCommand("update_nitter", "Обновить Nitter-инстансы")
+        ])
 
-        # Обновляем процент успеха
-        total_checks = account.get('check_count', 1)
-        fail_count = account.get('fail_count', 0)
-        account['success_rate'] = 100 * (total_checks - fail_count) / total_checks
+        # Инициализируем данные
+        init_accounts()
 
-        # Обновляем метод проверки
-        account['check_method'] = method
+        # Создаем файл прокси, если не существует
+        if not os.path.exists(PROXIES_FILE):
+            save_json(PROXIES_FILE, {"proxies": []})
 
-        # Если это первая проверка
-        if not last_id:
-            account['last_tweet_id'] = tweet_id
-            logger.info(f"Аккаунт @{username}: первая проверка, сохранен ID {tweet_id}")
-            return True
+        # Изменяем приоритеты методов, ставим web первым
+        settings = get_settings()
+        settings["scraper_methods"] = ["web", "nitter", "api"]
+        save_json(SETTINGS_FILE, settings)
 
-        # Если нашли новый твит
-        elif tweet_id != last_id:
-            account['last_tweet_id'] = tweet_id
-            logger.info(f"Аккаунт @{username}: новый твит {tweet_id}, отправляем уведомления")
-
-            # Отправляем уведомления всем подписчикам
-            if tweet_data:
-                tweet_msg = f"🐦 @{username}:\n\n{tweet_data['text']}\n\n{tweet_data['url']}"
-                for chat_id in subs:
-                    try:
-                        await app.bot.send_message(chat_id=chat_id, text=tweet_msg)
-                        await asyncio.sleep(0.5)  # Небольшая задержка
-                    except Exception as e:
-                        logger.error(f"Ошибка отправки сообщения в чат {chat_id}: {e}")
-            return True
-        else:
-            logger.info(f"Аккаунт @{username}: нет новых твитов (метод: {method})")
-            return False
-
-    except Exception as e:
-        logger.error(f"Ошибка при обработке аккаунта @{username}: {e}")
-        traceback.print_exc()
-
-        # Увеличиваем счетчик неудач
-        account['fail_count'] = account.get('fail_count', 0) + 1
-
-        # Обновляем процент успеха
-        total_checks = account.get('check_count', 1)
-        fail_count = account.get('fail_count', 0)
-        account['success_rate'] = 100 * (total_checks - fail_count) / total_checks
-
-        # Уменьшаем приоритет проблемных аккаунтов
-        if account.get('fail_count', 0) > 3:
-            account['priority'] = max(0.1, account.get('priority', 1.0) * 0.9)
-
-        return True
-
-
-async def on_startup(app):
-    """Вызывается при запуске бота"""
-    global background_task
-
-    # Инициализируем команды
-    await app.bot.set_my_commands([
-        BotCommand("start", "Начало работы"),
-        BotCommand("add", "Добавить аккаунт"),
-        BotCommand("remove", "Удалить аккаунт"),
-        BotCommand("list", "Список аккаунтов"),
-        BotCommand("check", "Проверить твиты"),
-        BotCommand("interval", "Интервал проверки"),
-        BotCommand("settings", "Настройки бота"),
-        BotCommand("proxy", "Управление прокси"),
-        BotCommand("stats", "Статистика мониторинга"),
-        BotCommand("update_nitter", "Обновить Nitter-инстансы")
-    ])
-
-    # Инициализируем данные
-    init_accounts()
-
-    # Создаем файл прокси, если не существует
-    if not os.path.exists(PROXIES_FILE):
-        save_json(PROXIES_FILE, {"proxies": []})
-
-    # Обновляем список работающих Nitter-инстансов
-    try:
-        logger.info("Обновление списка Nitter-инстансов...")
-        await update_nitter_instances()
-    except Exception as e:
-        logger.error(f"Ошибка при обновлении Nitter-инстансов: {e}")
-
-    # Запускаем фоновую задачу
-    background_task = asyncio.create_task(background_check(app))
-    logger.info("Бот запущен, фоновая задача активирована")
-
-
-async def on_shutdown(app):
-    """Вызывается при остановке бота"""
-    global background_task
-    if background_task and not background_task.cancelled():
-        logger.info("Останавливаем фоновую задачу...")
-        background_task.cancel()
+        # Обновляем список работающих Nitter-инстансов
         try:
-            await background_task
-        except asyncio.CancelledError:
-            pass
-        logger.info("Фоновая задача остановлена")
+            logger.info("Обновление списка Nitter-инстансов...")
+            await update_nitter_instances()
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении Nitter-инстансов: {e}")
 
-    # Закрываем все асинхронные сессии
-    scrapers = TwitterScrapers()
-    await scrapers.close_async_session()
+        # Запускаем фоновую задачу
+        background_task = asyncio.create_task(background_check(app))
+        logger.info("Бот запущен, фоновая задача активирована")
 
+    async def on_shutdown(app):
+        """Вызывается при остановке бота"""
+        global background_task
+        if background_task and not background_task.cancelled():
+            logger.info("Останавливаем фоновую задачу...")
+            background_task.cancel()
+            try:
+                await background_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Фоновая задача остановлена")
 
-def main():
-    # Проверяем наличие токена
-    if not TG_TOKEN:
-        logger.error("TG_TOKEN не указан в .env файле")
-        return
+        # Закрываем все асинхронные сессии
+        scrapers = TwitterScrapers()
+        await scrapers.close_async_session()
 
-    # Создаем файлы по умолчанию
-    for path, default in [
-        (SUBSCRIBERS_FILE, []),
-        (SETTINGS_FILE, {
-            "check_interval": DEFAULT_CHECK_INTERVAL,
-            "enabled": True,
-            "use_proxies": False,
-            "scraper_methods": ["nitter", "web", "api"],
-            "max_retries": 3,
-            "cache_expiry": 3600,
-            "randomize_intervals": True,
-            "min_interval_factor": 0.8,
-            "max_interval_factor": 1.2,
-            "parallel_checks": 3,
-            "nitter_instances": []
-        })
-    ]:
-        if not os.path.exists(path):
-            save_json(path, default)
+    def main():
+        # Проверяем наличие токена
+        if not TG_TOKEN:
+            logger.error("TG_TOKEN не указан в .env файле")
+            return
 
-    # Создаем и настраиваем приложение
-    app = ApplicationBuilder().token(TG_TOKEN).post_init(on_startup).post_shutdown(on_shutdown).build()
+        # Создаем файлы по умолчанию
+        for path, default in [
+            (SUBSCRIBERS_FILE, []),
+            (SETTINGS_FILE, {
+                "check_interval": DEFAULT_CHECK_INTERVAL,
+                "enabled": True,
+                "use_proxies": False,
+                "scraper_methods": ["web", "nitter", "api"],  # web на первом месте!
+                "max_retries": 3,
+                "cache_expiry": 3600,
+                "randomize_intervals": True,
+                "min_interval_factor": 0.8,
+                "max_interval_factor": 1.2,
+                "parallel_checks": 3,
+                "nitter_instances": []
+            })
+        ]:
+            if not os.path.exists(path):
+                save_json(path, default)
 
-    # Добавляем обработчики команд
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("remove", cmd_remove))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("check", cmd_check))
-    app.add_handler(CommandHandler("interval", cmd_interval))
-    app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("proxy", cmd_proxy))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("update_nitter", cmd_update_nitter))
+        # Создаем и настраиваем приложение
+        app = ApplicationBuilder().token(TG_TOKEN).post_init(on_startup).post_shutdown(on_shutdown).build()
 
-    # Обработчик для кнопок
-    app.add_handler(CallbackQueryHandler(button_handler))
+        # Добавляем обработчики команд
+        app.add_handler(CommandHandler("start", cmd_start))
+        app.add_handler(CommandHandler("add", cmd_add))
+        app.add_handler(CommandHandler("remove", cmd_remove))
+        app.add_handler(CommandHandler("list", cmd_list))
+        app.add_handler(CommandHandler("check", cmd_check))
+        app.add_handler(CommandHandler("interval", cmd_interval))
+        app.add_handler(CommandHandler("settings", cmd_settings))
+        app.add_handler(CommandHandler("proxy", cmd_proxy))
+        app.add_handler(CommandHandler("stats", cmd_stats))
+        app.add_handler(CommandHandler("update_nitter", cmd_update_nitter))
 
-    # Запускаем бота
-    settings = get_settings()
-    interval_mins = settings["check_interval"] // 60
-    logger.info(f"🚀 Бот запущен, интервал проверки: {interval_mins} мин.")
-    app.run_polling()
+        # Обработчик для кнопок
+        app.add_handler(CallbackQueryHandler(button_handler))
 
+        # Запускаем бота
+        settings = get_settings()
+        interval_mins = settings["check_interval"] // 60
+        logger.info(f"🚀 Бот запущен, интервал проверки: {interval_mins} мин.")
+        app.run_polling()
 
-if __name__ == "__main__":
-    main()
+    if __name__ == "__main__":
+        main()
